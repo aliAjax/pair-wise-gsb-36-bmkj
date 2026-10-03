@@ -1,0 +1,11 @@
+{
+  "projectId": "pair-wise-gsb-36",
+  "projectName": "pair-wise-gsb-36",
+  "category": "困难 Python 项目",
+  "businessDomain": "水资源管理",
+  "projectForm": "完整项目",
+  "codeScope": "backend, frontend",
+  "languages": ["Python", "HTML", "CSS", "JavaScript"],
+  "summary": "跨区域水资源使用权账户、计量、转让审批和干旱情景分配服务。",
+  "containerized": false
+}
