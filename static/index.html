@@ -1,18 +1,28 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>水资源权配置</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}small{color:#667}button{cursor:pointer}</style></head>
-<body><h1>跨区域水资源使用权</h1><p>示例账户初始化后，可查看余额、发起转让、审核，并模拟干旱分配。</p>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto;max-height:340px}small{color:#667}button{cursor:pointer}.settle{background:#eef5ff;border-color:#9ec1ef}</style></head>
+<body><h1>跨区域水资源使用权</h1><p>账户、转让、取水与干旱情景均按<b>结算日期</b>推导；转让到生效日才影响两方，同日转让先于取水结清。</p>
+<div class="card settle"><h2>结算日期</h2><input id="asof" type="date" value="2026-10-03"><small>留空则为今天。账户列表、转让详情、干旱情景按同一日期显示。</small></div>
 <div class="card"><h2>身份</h2><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>meter</option><option>viewer</option></select></div>
-<div class="card"><h2>账户</h2><button onclick="getAccounts()">刷新账户</button><pre id="accounts">等待操作…</pre></div>
-<div class="card"><h2>发起转让</h2><input id="from" type="number" value="1" placeholder="转出账户"><input id="to" type="number" value="2" placeholder="转入账户"><input id="amount" type="number" value="400"><input id="date" type="date" value="2026-06-01"><button onclick="transfer()">提交审批</button><pre id="result"></pre></div>
-<div class="card"><h2>审批最新转让</h2><input id="transfer_id" type="number" placeholder="转让 ID"><button onclick="approve()">批准</button><button onclick="reject()">退回</button></div>
-<div class="card"><h2>干旱情景</h2><input id="supply" type="number" value="1200"><input id="reduction" type="number" value="0.3" step="0.1"><button onclick="simulate()">模拟</button><pre id="drought">等待操作…</pre></div>
+<div class="card"><h2>账户</h2><button onclick="getAccounts()">按结算日期刷新账户</button><pre id="accounts">等待操作…</pre></div>
+<div class="card"><h2>发起转让</h2><input id="from" type="number" value="1" placeholder="转出账户"><input id="to" type="number" value="2" placeholder="转入账户"><input id="amount" type="number" value="400"><input id="date" type="date" value="2026-11-01"><button onclick="transfer()">提交审批</button><pre id="result"></pre></div>
+<div class="card"><h2>转让处理</h2><input id="transfer_id" type="number" placeholder="转让 ID"><button onclick="approve()">批准</button><button onclick="reject()">退回</button><button onclick="cancelTransfer()">取消未生效</button><input id="newdate" type="date" title="新生效日期"><button onclick="reschedule()">改期并重算</button><button onclick="detail()">查看详情</button></div>
+<div class="card"><h2>登记取水</h2><input id="usage_acct" type="number" value="1" placeholder="账户"><input id="usage_amount" type="number" value="50" placeholder="取水量"><input id="usage_event" value="EVT-0001" placeholder="计量事件编号"><input id="usage_date" type="date" value="2026-10-03"><button onclick="usage()">登记（同日转让先结清）</button></div>
+<div class="card"><h2>转让列表</h2><button onclick="getTransfers()">刷新转让</button><pre id="transfers">等待操作…</pre></div>
+<div class="card"><h2>干旱情景</h2><input id="supply" type="number" value="1200"><input id="reduction" type="number" value="0.3" step="0.1"><button onclick="simulate()">按结算日期模拟</button><pre id="drought">等待操作…</pre></div>
 <script>
 const headers=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
-async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
-async function getAccounts(){try{accounts.textContent=JSON.stringify(await call('/api/accounts'),null,2)}catch(e){accounts.textContent=e.message}}
-async function transfer(){try{result.textContent=JSON.stringify(await call('/api/transfers',{method:'POST',headers:headers(),body:JSON.stringify({from_account_id:+from.value,to_account_id:+to.value,amount:+amount.value,effective_date:date.value})}),null,2)}catch(e){result.textContent=e.message}}
-async function approve(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/approve',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){result.textContent=e.message}}
-async function reject(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/reject',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){result.textContent=e.message}}
-async function simulate(){try{drought.textContent=JSON.stringify(await call('/api/drought/simulate?supply='+supply.value+'&reduction='+reduction.value),null,2)}catch(e){drought.textContent=e.message}}
+const asOfParam=()=>asof.value?('?as_of='+asof.value):'';
+async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error+(j.details?'：'+JSON.stringify(j.details):''));return j}
+function show(el,e){document.getElementById(el).textContent=e.message}
+async function getAccounts(){try{accounts.textContent=JSON.stringify(await call('/api/accounts'+asOfParam()),null,2)}catch(e){show('accounts',e)}}
+async function getTransfers(){try{transfers.textContent=JSON.stringify(await call('/api/transfers'+asOfParam()),null,2)}catch(e){show('transfers',e)}}
+async function transfer(){try{result.textContent=JSON.stringify(await call('/api/transfers',{method:'POST',headers:headers(),body:JSON.stringify({from_account_id:+from.value,to_account_id:+to.value,amount:+amount.value,effective_date:date.value})}),null,2)}catch(e){show('result',e)}}
+async function approve(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/approve',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){show('result',e)}}
+async function reject(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/reject',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){show('result',e)}}
+async function cancelTransfer(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/cancel'+asOfParam(),{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){show('result',e)}}
+async function reschedule(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/reschedule'+asOfParam(),{method:'POST',headers:headers(),body:JSON.stringify({effective_date:newdate.value})}),null,2)}catch(e){show('result',e)}}
+async function detail(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+asOfParam()),null,2)}catch(e){show('result',e)}}
+async function usage(){try{result.textContent=JSON.stringify(await call('/api/usage',{method:'POST',headers:headers(),body:JSON.stringify({account_id:+usage_acct.value,amount:+usage_amount.value,meter_event_id:usage_event.value,occurred_at:usage_date.value})}),null,2)}catch(e){show('result',e)}}
+async function simulate(){try{drought.textContent=JSON.stringify(await call('/api/drought/simulate?supply='+supply.value+'&reduction='+reduction.value+(asof.value?'&as_of='+asof.value:'')),null,2)}catch(e){show('drought',e)}}
 </script></body></html>
