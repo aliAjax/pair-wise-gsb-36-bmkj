@@ -1,8 +1,26 @@
-"""Cross-region water-right allocation and transfer service (standard library only)."""
+"""Cross-region water-right allocation and transfer service (standard library only).
+
+Settlement model
+----------------
+Accounts hold an immutable licensed ``quota``. Transfers never overwrite that
+column: an approved transfer enters both ledgers on its ``effective_date`` and
+every balance is derived from the entries settled up to a settlement date::
+
+    settled_quota(d) = quota + approved incoming (effective <= d)
+                             - approved outgoing (effective <= d)
+    settled_used(d)  = usage records with occurred_at <= d
+    available(d)     = settled_quota(d) - settled_used(d)
+
+Before the effective date the water still belongs to the transfer-out party,
+so pending and future-effective transfers do not reduce availability. On the
+effective date transfers settle before same-day usage. Cancelling a
+not-yet-effective transfer or moving its effective date replays the affected
+usage records; original entries are never rewritten, and replays are pure
+validations that can be retried safely.
+"""
 from __future__ import annotations
 
 import argparse
-import calendar
 import json
 import os
 import sqlite3
@@ -14,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "water_rights.db"
+EPS = 1e-9
 
 
 def utcnow() -> str:
@@ -25,6 +44,13 @@ def parse_date(value: str, field: str = "日期") -> date:
         return date.fromisoformat(value)
     except (TypeError, ValueError) as exc:
         raise DomainError(f"{field}必须是 YYYY-MM-DD") from exc
+
+
+def resolve_as_of(as_of: str | None) -> str:
+    """Normalise a settlement-date parameter (default: today)."""
+    if as_of is None or str(as_of).strip() == "":
+        return date.today().isoformat()
+    return parse_date(str(as_of).strip(), "结算日期").isoformat()
 
 
 class DomainError(Exception):
@@ -119,6 +145,101 @@ class Database:
             (actor, action, entity_type, entity_id, json.dumps(details, ensure_ascii=False), utcnow()),
         )
 
+    # ------------------------------------------------------------------
+    # Settlement-date ledger
+    # ------------------------------------------------------------------
+
+    def _transfer_sum(self, conn: sqlite3.Connection, column: str, account_id: int,
+                      as_of_iso: str, future: bool = False) -> float:
+        op = ">" if future else "<="
+        row = conn.execute(
+            f"SELECT COALESCE(SUM(amount),0) total FROM transfers "
+            f"WHERE {column}=? AND status='approved' AND effective_date{op}?",
+            (account_id, as_of_iso),
+        ).fetchone()
+        return float(row["total"])
+
+    def _settled_quota(self, conn: sqlite3.Connection, account_id: int, as_of_iso: str,
+                       exclude_transfer_id: int | None = None) -> float:
+        """Licensed quota after approved transfers effective on/before the date."""
+        account = conn.execute("SELECT quota FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if not account:
+            raise DomainError("水权账户不存在", 404)
+        exclude_sql = "AND id<>?" if exclude_transfer_id is not None else ""
+        params: list[Any] = [account_id, as_of_iso]
+        if exclude_transfer_id is not None:
+            params.append(exclude_transfer_id)
+        row = conn.execute(
+            f"SELECT COALESCE(SUM(amount),0) total FROM transfers WHERE to_account_id=? "
+            f"AND status='approved' AND effective_date<=? {exclude_sql}",
+            params,
+        ).fetchone()
+        incoming = float(row["total"])
+        row = conn.execute(
+            f"SELECT COALESCE(SUM(amount),0) total FROM transfers WHERE from_account_id=? "
+            f"AND status='approved' AND effective_date<=? {exclude_sql}",
+            params,
+        ).fetchone()
+        outgoing = float(row["total"])
+        return float(account["quota"]) + incoming - outgoing
+
+    def _settled_used(self, conn: sqlite3.Connection, account_id: int, as_of_iso: str) -> float:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) total FROM usage_records WHERE account_id=? AND occurred_at<=?",
+            (account_id, as_of_iso),
+        ).fetchone()
+        return float(row["total"])
+
+    def _settlement(self, conn: sqlite3.Connection, account_id: int, as_of_iso: str,
+                    exclude_transfer_id: int | None = None) -> dict[str, float]:
+        quota = self._settled_quota(conn, account_id, as_of_iso, exclude_transfer_id)
+        used = self._settled_used(conn, account_id, as_of_iso)
+        incoming = self._transfer_sum(conn, "to_account_id", account_id, as_of_iso)
+        outgoing = self._transfer_sum(conn, "from_account_id", account_id, as_of_iso)
+        future_in = self._transfer_sum(conn, "to_account_id", account_id, as_of_iso, future=True)
+        future_out = self._transfer_sum(conn, "from_account_id", account_id, as_of_iso, future=True)
+        return {
+            "base_quota": float(conn.execute("SELECT quota FROM accounts WHERE id=?", (account_id,)).fetchone()["quota"]),
+            "quota": quota,
+            "used": used,
+            "available": max(0.0, quota - used),
+            "settled_incoming": incoming,
+            "settled_outgoing": outgoing,
+            "future_incoming": future_in,
+            "future_outgoing": future_out,
+        }
+
+    def _assert_feasible(self, conn: sqlite3.Connection, source: sqlite3.Row, target: sqlite3.Row,
+                         amount: float, effective_iso: str, exclude_transfer_id: int | None) -> None:
+        """Validate a transfer against the ledger as it will stand at its effective date.
+
+        Same-day transfers settle first, so usage already booked on the
+        effective date is counted and the late party receives the conflict.
+        """
+        quota_d = self._settled_quota(conn, source["id"], effective_iso, exclude_transfer_id)
+        used_d = self._settled_used(conn, source["id"], effective_iso)
+        available_d = quota_d - used_d
+        if amount > available_d + EPS:
+            raise DomainError("按生效日结算后转出方可用额度不足", 409)
+        impact = conn.execute(
+            "SELECT * FROM impact_rules WHERE source_region=? AND target_region=?",
+            (source["region"], target["region"]),
+        ).fetchone()
+        if impact:
+            minimum = quota_d * float(impact["min_source_fraction"])
+            if available_d - amount + EPS < minimum:
+                raise DomainError("转让会违反下游第三方最小留存约束", 409)
+
+    def _account_row(self, conn: sqlite3.Connection, account_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if not row:
+            raise DomainError("水权账户不存在", 404)
+        return row
+
+    # ------------------------------------------------------------------
+    # Setup endpoints
+    # ------------------------------------------------------------------
+
     def create_account(self, actor: str, payload: dict[str, Any], role: str = "editor") -> dict[str, Any]:
         if role != "editor":
             raise DomainError("只有配额管理员可以创建账户", 403)
@@ -179,24 +300,21 @@ class Database:
             self._audit(conn, actor, "impact_rule.saved", "region", None, {"source": source_region, "target": target_region, "min_fraction": min_source_fraction})
         return {"source_region": source_region, "target_region": target_region, "min_source_fraction": min_source_fraction, "note": note}
 
-    def _account_row(self, conn: sqlite3.Connection, account_id: int) -> sqlite3.Row:
-        row = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
-        if not row:
-            raise DomainError("水权账户不存在", 404)
-        return row
-
-    def _reserved_outgoing(self, conn: sqlite3.Connection, account_id: int) -> float:
-        row = conn.execute("SELECT COALESCE(SUM(amount),0) total FROM transfers WHERE from_account_id=? AND status='pending'", (account_id,)).fetchone()
-        return float(row["total"])
+    # ------------------------------------------------------------------
+    # Availability
+    # ------------------------------------------------------------------
 
     def available(self, account_id: int, as_of: str | None = None) -> dict[str, Any]:
-        if as_of:
-            parse_date(as_of, "查询日期")
+        as_of_iso = resolve_as_of(as_of)
         with self.connect() as conn:
-            account = self._account_row(conn, account_id)
-            reserved = self._reserved_outgoing(conn, account_id)
-            value = max(0.0, float(account["quota"]) - float(account["used"]) - reserved)
-        return {"account_id": account_id, "available": value, "reserved_outgoing": reserved, "quota": account["quota"], "used": account["used"]}
+            self._account_row(conn, account_id)
+            result = {"account_id": account_id, "as_of": as_of_iso}
+            result.update(self._settlement(conn, account_id, as_of_iso))
+        return result
+
+    # ------------------------------------------------------------------
+    # Transfers
+    # ------------------------------------------------------------------
 
     def create_transfer(self, actor: str, payload: dict[str, Any], role: str = "editor") -> dict[str, Any]:
         if role != "editor":
@@ -210,38 +328,30 @@ class Database:
         if source_id == target_id or amount <= 0:
             raise DomainError("转让账户不能相同，转让量必须大于 0")
         effective = parse_date(str(payload.get("effective_date", "")), "生效日期")
+        effective_iso = effective.isoformat()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             source = self._account_row(conn, source_id)
             target = self._account_row(conn, target_id)
-            if not (source["valid_from"] <= effective.isoformat() <= source["valid_to"]):
+            if not (source["valid_from"] <= effective_iso <= source["valid_to"]):
                 raise DomainError("转出账户在生效日无效", 409)
-            if not (target["valid_from"] <= effective.isoformat() <= target["valid_to"]):
+            if not (target["valid_from"] <= effective_iso <= target["valid_to"]):
                 raise DomainError("转入账户在生效日无效", 409)
-            reserved = self._reserved_outgoing(conn, source_id)
-            available = float(source["quota"]) - float(source["used"]) - reserved
-            if amount > available + 1e-9:
-                raise DomainError("可用额度不足，待审批转让会预占额度", 409)
-            # More critical users (smaller priority number) cannot transfer their
-            # protected allocation to a less critical user.
             if int(source["priority"]) > int(target["priority"]):
                 raise DomainError("不能把较低优先级水量转给更高优先级账户", 409)
-            impact = conn.execute(
-                "SELECT * FROM impact_rules WHERE source_region=? AND target_region=?",
-                (source["region"], target["region"]),
-            ).fetchone()
-            if impact:
-                remaining = available - amount
-                minimum = float(source["quota"]) * float(impact["min_source_fraction"])
-                if remaining + 1e-9 < minimum:
-                    raise DomainError("转让会违反下游第三方最小留存约束", 409)
+            # Advisory check against the projected settlement at the effective
+            # date. Pending transfers do not reserve water; approval is the
+            # authoritative gate, so this never blocks the source from using
+            # the water before the effective date.
+            self._assert_feasible(conn, source, target, amount, effective_iso, None)
             cur = conn.execute(
                 "INSERT INTO transfers(from_account_id,to_account_id,amount,effective_date,created_by,created_at) VALUES(?,?,?,?,?,?)",
-                (source_id, target_id, amount, effective.isoformat(), actor, utcnow()),
+                (source_id, target_id, amount, effective_iso, actor, utcnow()),
             )
             self._audit(conn, actor, "transfer.created", "transfer", cur.lastrowid,
-                        {"source": source_id, "target": target_id, "amount": amount, "effective_date": effective.isoformat()})
-            return dict(conn.execute("SELECT * FROM transfers WHERE id=?", (cur.lastrowid,)).fetchone())
+                        {"source": source_id, "target": target_id, "amount": amount, "effective_date": effective_iso})
+            row = dict(conn.execute("SELECT * FROM transfers WHERE id=?", (cur.lastrowid,)).fetchone())
+        return self._with_settlement_view(row, resolve_as_of(None))
 
     def approve_transfer(self, transfer_id: int, actor: str, role: str = "reviewer") -> dict[str, Any]:
         if role != "reviewer":
@@ -258,31 +368,26 @@ class Database:
             source = self._account_row(conn, transfer["from_account_id"])
             target = self._account_row(conn, transfer["to_account_id"])
             amount = float(transfer["amount"])
-            # Compute against pending reservations other than this transfer.
-            other_reserved = conn.execute(
-                "SELECT COALESCE(SUM(amount),0) total FROM transfers WHERE from_account_id=? AND status='pending' AND id<>?",
-                (source["id"], transfer_id),
-            ).fetchone()["total"]
-            available = float(source["quota"]) - float(source["used"]) - float(other_reserved)
-            if amount > available + 1e-9:
-                raise DomainError("审批时额度已被其他记录占用，不能批准", 409)
-            impact = conn.execute(
-                "SELECT * FROM impact_rules WHERE source_region=? AND target_region=?",
-                (source["region"], target["region"]),
-            ).fetchone()
-            if impact:
-                minimum = float(source["quota"]) * float(impact["min_source_fraction"])
-                if available - amount + 1e-9 < minimum:
-                    raise DomainError("审批时下游最小留存约束不再满足", 409)
-            # The approved amount moves between quota balances. Keeping the
-            # movement in the quota column preserves the original allocation
-            # while making every downstream availability calculation consistent.
-            conn.execute("UPDATE accounts SET quota=quota-? WHERE id=?", (amount, source["id"]))
-            conn.execute("UPDATE accounts SET quota=quota+? WHERE id=?", (amount, target["id"]))
-            conn.execute("UPDATE transfers SET status='approved',approved_by=?,approved_at=? WHERE id=?", (actor, utcnow(), transfer_id))
-            self._audit(conn, actor, "transfer.approved", "transfer", transfer_id, {"amount": amount})
-            row = conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone()
-        return dict(row)
+            effective_iso = transfer["effective_date"]
+            if not (source["valid_from"] <= effective_iso <= source["valid_to"]):
+                raise DomainError("转出账户在生效日无效", 409)
+            if not (target["valid_from"] <= effective_iso <= target["valid_to"]):
+                raise DomainError("转入账户在生效日无效", 409)
+            if int(source["priority"]) > int(target["priority"]):
+                raise DomainError("不能把较低优先级水量转给更高优先级账户", 409)
+            # Authoritative settlement-date check inside the write lock:
+            # same-day usage committed by a competing meter transaction is
+            # visible here, so whichever request settles second gets 409 and
+            # the first transaction's ledger stays untouched.
+            self._assert_feasible(conn, source, target, amount, effective_iso, transfer_id)
+            conn.execute(
+                "UPDATE transfers SET status='approved',approved_by=?,approved_at=? WHERE id=?",
+                (actor, utcnow(), transfer_id),
+            )
+            self._audit(conn, actor, "transfer.approved", "transfer", transfer_id,
+                        {"amount": amount, "effective_date": effective_iso})
+            row = dict(conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone())
+        return self._with_settlement_view(row, resolve_as_of(None))
 
     def reject_transfer(self, transfer_id: int, actor: str, role: str = "reviewer") -> dict[str, Any]:
         if role != "reviewer":
@@ -298,6 +403,71 @@ class Database:
             self._audit(conn, actor, "transfer.rejected", "transfer", transfer_id, {})
         return {"id": transfer_id, "status": "rejected"}
 
+    def _get_editable_transfer(self, conn: sqlite3.Connection, transfer_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone()
+        if not row:
+            raise DomainError("转让记录不存在", 404)
+        if row["status"] in ("rejected", "cancelled"):
+            raise DomainError("转让已终结，不能再修改", 409)
+        if row["status"] == "approved" and row["effective_date"] <= date.today().isoformat():
+            raise DomainError("转让已经生效，不能再修改", 409)
+        return row
+
+    def cancel_transfer(self, transfer_id: int, actor: str, role: str = "editor") -> dict[str, Any]:
+        """Cancel a pending or approved-not-yet-effective transfer, then replay."""
+        if role != "editor":
+            raise DomainError("只有水权编辑人员可以取消转让", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._get_editable_transfer(conn, transfer_id)
+            old_status = row["status"]
+            effective_iso = row["effective_date"]
+            conn.execute("UPDATE transfers SET status='cancelled' WHERE id=?", (transfer_id,))
+            self._audit(conn, actor, "transfer.cancelled", "transfer", transfer_id,
+                        {"former_status": old_status, "effective_date": effective_iso})
+            # Settlement only changes for entries on/after the effective date.
+            replay = self._replay_many(
+                conn, [int(row["from_account_id"]), int(row["to_account_id"])], effective_iso)
+            saved = dict(conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone())
+        return {"transfer": self._with_settlement_view(saved, resolve_as_of(None)), "recompute": replay}
+
+    def reschedule_transfer(self, transfer_id: int, actor: str, payload: dict[str, Any],
+                            role: str = "editor") -> dict[str, Any]:
+        """Move an effective date, then replay the affected usage window."""
+        if role != "editor":
+            raise DomainError("只有水权编辑人员可以调整生效日期", 403)
+        new_date = parse_date(str(payload.get("effective_date", "")), "生效日期")
+        new_iso = new_date.isoformat()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._get_editable_transfer(conn, transfer_id)
+            old_iso = row["effective_date"]
+            source = self._account_row(conn, int(row["from_account_id"]))
+            target = self._account_row(conn, int(row["to_account_id"]))
+            if not (source["valid_from"] <= new_iso <= source["valid_to"]):
+                raise DomainError("转出账户在新生效日无效", 409)
+            if not (target["valid_from"] <= new_iso <= target["valid_to"]):
+                raise DomainError("转入账户在新生效日无效", 409)
+            if int(source["priority"]) > int(target["priority"]):
+                raise DomainError("不能把较低优先级水量转给更高优先级账户", 409)
+            # Feasibility at the new settlement date (this very transfer is
+            # excluded so a repeat submission with the same date is a harmless
+            # no-op and never deducts water twice).
+            self._assert_feasible(conn, source, target, float(row["amount"]), new_iso, transfer_id)
+            conn.execute("UPDATE transfers SET effective_date=? WHERE id=?", (new_iso, transfer_id))
+            self._audit(conn, actor, "transfer.rescheduled", "transfer", transfer_id,
+                        {"old_date": old_iso, "new_date": new_iso, "status": row["status"]})
+            # Only the band between the two dates is settled differently.
+            since = min(old_iso, new_iso)
+            replay = self._replay_many(
+                conn, [int(row["from_account_id"]), int(row["to_account_id"])], since)
+            saved = dict(conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone())
+        return {"transfer": self._with_settlement_view(saved, resolve_as_of(None)), "recompute": replay}
+
+    # ------------------------------------------------------------------
+    # Metered usage
+    # ------------------------------------------------------------------
+
     def record_usage(self, actor: str, payload: dict[str, Any], role: str = "meter") -> dict[str, Any]:
         if role not in {"meter", "editor"}:
             raise DomainError("只有计量员可以登记取水", 403)
@@ -308,96 +478,239 @@ class Database:
             raise DomainError("账户和取水量必须是数值") from exc
         meter_event_id = str(payload.get("meter_event_id", "")).strip()
         occurred = parse_date(str(payload.get("occurred_at", "")), "计量日期")
+        occurred_iso = occurred.isoformat()
         if amount <= 0 or not meter_event_id:
             raise DomainError("取水量必须大于 0，计量事件编号不能为空")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             account = self._account_row(conn, account_id)
-            if not (account["valid_from"] <= occurred.isoformat() <= account["valid_to"]):
+            if not (account["valid_from"] <= occurred_iso <= account["valid_to"]):
                 raise DomainError("取水日期不在许可有效期内", 409)
-            reserved = self._reserved_outgoing(conn, account_id)
-            available = float(account["quota"]) - float(account["used"]) - reserved
-            if amount > available + 1e-9:
-                raise DomainError("取水超过可用额度", 409)
-            season = conn.execute("SELECT max_fraction FROM season_rules WHERE region=? AND month=?", (account["region"], occurred.month)).fetchone()
-            month_total = conn.execute(
-                "SELECT COALESCE(SUM(amount),0) total FROM usage_records WHERE account_id=? AND substr(occurred_at,1,7)=?",
-                (account_id, occurred.strftime("%Y-%m")),
-            ).fetchone()["total"]
+            # Same-day approved transfers settle first, so they are already
+            # part of the quota at this date. On failure the transaction rolls
+            # back: no usage row, no cached total — the prior ledger is intact.
+            quota_d = self._settled_quota(conn, account_id, occurred_iso)
+            used_d = self._settled_used(conn, account_id, occurred_iso)
+            if amount > quota_d - used_d + EPS:
+                raise DomainError("先结清同日转让后可用额度不足，取水登记失败", 409)
+            season = conn.execute(
+                "SELECT max_fraction FROM season_rules WHERE region=? AND month=?",
+                (account["region"], occurred.month),
+            ).fetchone()
             if season:
-                cap = float(account["quota"]) * float(season["max_fraction"])
-                if float(month_total) + amount > cap + 1e-9:
+                month_total = conn.execute(
+                    "SELECT COALESCE(SUM(amount),0) total FROM usage_records "
+                    "WHERE account_id=? AND substr(occurred_at,1,7)=? AND occurred_at<=?",
+                    (account_id, occurred.strftime("%Y-%m"), occurred_iso),
+                ).fetchone()["total"]
+                cap = quota_d * float(season["max_fraction"])
+                if float(month_total) + amount > cap + EPS:
                     raise DomainError("本次取水超过该月份的季节配额", 409)
             try:
                 cur = conn.execute(
                     "INSERT INTO usage_records(account_id,meter_event_id,amount,occurred_at,actor,created_at) VALUES(?,?,?,?,?,?)",
-                    (account_id, meter_event_id, amount, occurred.isoformat(), actor, utcnow()),
+                    (account_id, meter_event_id, amount, occurred_iso, actor, utcnow()),
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("计量事件已登记，不能重复计水", 409) from exc
             conn.execute("UPDATE accounts SET used=used+? WHERE id=?", (amount, account_id))
             self._audit(conn, actor, "usage.recorded", "account", account_id,
-                        {"amount": amount, "occurred_at": occurred.isoformat(), "meter_event_id": meter_event_id})
+                        {"amount": amount, "occurred_at": occurred_iso, "meter_event_id": meter_event_id})
             row = conn.execute("SELECT * FROM usage_records WHERE id=?", (cur.lastrowid,)).fetchone()
         return dict(row)
 
-    def simulate_drought(self, total_supply: float, reduction: float = 0.0, role: str = "viewer") -> dict[str, Any]:
+    # ------------------------------------------------------------------
+    # Recomputation (pure replay, safe to retry)
+    # ------------------------------------------------------------------
+
+    def _replay_account(self, conn: sqlite3.Connection, account_id: int, since_iso: str) -> dict[str, Any]:
+        account = self._account_row(conn, account_id)
+        rows = conn.execute(
+            "SELECT * FROM usage_records WHERE account_id=? AND occurred_at>=? ORDER BY occurred_at,id",
+            (account_id, since_iso),
+        ).fetchall()
+        conflicts: list[dict[str, Any]] = []
+        for row in rows:
+            d = row["occurred_at"]
+            quota_d = self._settled_quota(conn, account_id, d)
+            # Cumulative usage through this record (same-day entries ordered by id).
+            used_through = conn.execute(
+                "SELECT COALESCE(SUM(amount),0) total FROM usage_records "
+                "WHERE account_id=? AND (occurred_at<? OR (occurred_at=? AND id<=?))",
+                (account_id, d, d, row["id"]),
+            ).fetchone()["total"]
+            if float(used_through) > quota_d + EPS:
+                conflicts.append({
+                    "usage_id": int(row["id"]),
+                    "meter_event_id": row["meter_event_id"],
+                    "occurred_at": d,
+                    "amount": float(row["amount"]),
+                    "reason": "可用额度不足",
+                    "settled_quota": quota_d,
+                    "settled_used": float(used_through),
+                    "shortfall": float(used_through) - quota_d,
+                })
+                continue
+            season = conn.execute(
+                "SELECT max_fraction FROM season_rules WHERE region=? AND month=?",
+                (account["region"], int(d[5:7])),
+            ).fetchone()
+            if season:
+                month_cum = conn.execute(
+                    "SELECT COALESCE(SUM(amount),0) total FROM usage_records "
+                    "WHERE account_id=? AND substr(occurred_at,1,7)=? "
+                    "AND (occurred_at<? OR (occurred_at=? AND id<=?))",
+                    (account_id, d[:7], d, d, row["id"]),
+                ).fetchone()["total"]
+                cap = quota_d * float(season["max_fraction"])
+                if float(month_cum) > cap + EPS:
+                    conflicts.append({
+                        "usage_id": int(row["id"]),
+                        "meter_event_id": row["meter_event_id"],
+                        "occurred_at": d,
+                        "amount": float(row["amount"]),
+                        "reason": "季节配额超限",
+                        "settled_quota": quota_d,
+                        "month_total": float(month_cum),
+                        "season_cap": cap,
+                        "shortfall": float(month_cum) - cap,
+                    })
+        return {"account_id": account_id, "name": account["name"], "checked": len(rows),
+                "ok": not conflicts, "conflicts": conflicts}
+
+    def _replay_many(self, conn: sqlite3.Connection, account_ids: list[int], since_iso: str) -> dict[str, Any]:
+        seen: set[int] = set()
+        reports = []
+        for account_id in account_ids:
+            if account_id in seen:
+                continue
+            seen.add(account_id)
+            reports.append(self._replay_account(conn, account_id, since_iso))
+        return {"since": since_iso, "accounts": reports, "ok": all(r["ok"] for r in reports)}
+
+    def recompute(self, actor: str, account_id: int | None = None, since: str | None = None,
+                  role: str = "viewer") -> dict[str, Any]:
+        since_iso = "0001-01-01" if since in (None, "") else parse_date(str(since), "起始日期").isoformat()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if account_id is None:
+                ids = [int(r["id"]) for r in conn.execute("SELECT id FROM accounts ORDER BY id").fetchall()]
+            else:
+                ids = [int(self._account_row(conn, int(account_id))["id"])]
+            report = self._replay_many(conn, ids, since_iso)
+            report["recomputed_at"] = date.today().isoformat()
+            self._audit(conn, actor, "settlement.recomputed", "account", account_id,
+                        {"since": since_iso, "ok": report["ok"]})
+        return report
+
+    # ------------------------------------------------------------------
+    # Date-aware views
+    # ------------------------------------------------------------------
+
+    def _with_settlement_view(self, transfer: dict[str, Any], as_of_iso: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            item = dict(transfer)
+            item["as_of"] = as_of_iso
+            item["settled"] = item["status"] == "approved" and item["effective_date"] <= as_of_iso
+            item["source"] = self._settlement(conn, int(item["from_account_id"]), as_of_iso)
+            item["target"] = self._settlement(conn, int(item["to_account_id"]), as_of_iso)
+        return item
+
+    def simulate_drought(self, total_supply: float, reduction: float = 0.0,
+                         as_of: str | None = None, role: str = "viewer") -> dict[str, Any]:
         try:
             total_supply, reduction = float(total_supply), float(reduction)
         except (TypeError, ValueError) as exc:
             raise DomainError("供水量和削减比例必须是数值") from exc
         if total_supply < 0 or not 0 <= reduction < 1:
             raise DomainError("供水量不能为负，削减比例应在 0 到 1 之间")
+        as_of_iso = resolve_as_of(as_of)
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM accounts ORDER BY priority,name").fetchall()
+            settled = []
+            for row in rows:
+                quota_d = self._settled_quota(conn, int(row["id"]), as_of_iso)
+                used_d = self._settled_used(conn, int(row["id"]), as_of_iso)
+                settled.append({
+                    "row": row,
+                    "quota": quota_d,
+                    "used": used_d,
+                    "requested": max(0.0, quota_d - used_d),
+                    "valid": row["valid_from"] <= as_of_iso <= row["valid_to"],
+                })
         supply = total_supply * (1 - reduction)
         allocation: dict[int, float] = {}
         deficit: dict[int, float] = {}
         remaining = supply
         for priority in range(1, 6):
-            group = [r for r in rows if int(r["priority"]) == priority]
+            group = [s for s in settled if int(s["row"]["priority"]) == priority]
             if not group:
                 continue
             # During shortage, more critical rights receive their remaining
-            # allocation first; only then does water flow to lower priorities.
-            requested = sum(max(0.0, float(r["quota"]) - float(r["used"])) for r in group)
-            take = min(remaining, requested)
+            # settled allocation first; only then does water flow downstream.
+            requested = sum(s["requested"] for s in group)
             if requested <= 0:
                 continue
-            for row in group:
-                quota_left = max(0.0, float(row["quota"]) - float(row["used"]))
-                share = take * quota_left / requested
-                allocation[int(row["id"])] = share
-                deficit[int(row["id"])] = quota_left - share
+            take = min(remaining, requested)
+            for item in group:
+                share = take * item["requested"] / requested
+                allocation[int(item["row"]["id"])] = share
+                deficit[int(item["row"]["id"])] = item["requested"] - share
             remaining -= take
-            if remaining <= 1e-9:
-                for lower in rows:
-                    if int(lower["priority"]) > priority:
-                        left = max(0.0, float(lower["quota"]) - float(lower["used"]))
-                        allocation[int(lower["id"])] = 0.0
-                        deficit[int(lower["id"])] = left
+            if remaining <= EPS:
+                for lower in settled:
+                    if int(lower["row"]["priority"]) > priority:
+                        allocation[int(lower["row"]["id"])] = 0.0
+                        deficit[int(lower["row"]["id"])] = lower["requested"]
                 break
-        return {"total_supply": total_supply, "reduction": reduction, "effective_supply": supply,
-                "unallocated": remaining, "allocations": [
-                    {"account_id": int(r["id"]), "name": r["name"], "priority": r["priority"],
-                     "allocation": allocation.get(int(r["id"]), 0.0), "deficit": deficit.get(int(r["id"]), 0.0)}
-                    for r in rows
+        return {"as_of": as_of_iso, "total_supply": total_supply, "reduction": reduction,
+                "effective_supply": supply, "unallocated": remaining, "allocations": [
+                    {"account_id": int(s["row"]["id"]), "name": s["row"]["name"], "priority": s["row"]["priority"],
+                     "valid": s["valid"], "quota": s["quota"], "used": s["used"], "requested": s["requested"],
+                     "allocation": allocation.get(int(s["row"]["id"]), 0.0),
+                     "deficit": deficit.get(int(s["row"]["id"]), s["requested"])}
+                    for s in settled
                 ]}
 
-    def list_accounts(self) -> list[dict[str, Any]]:
+    def list_accounts(self, as_of: str | None = None) -> dict[str, Any]:
+        as_of_iso = resolve_as_of(as_of)
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM accounts ORDER BY id").fetchall()
-            result = []
+            accounts = []
             for row in rows:
                 item = dict(row)
-                item["available"] = max(0.0, float(row["quota"]) - float(row["used"]) - self._reserved_outgoing(conn, int(row["id"])))
-                result.append(item)
-        return result
+                item["as_of"] = as_of_iso
+                item["valid"] = row["valid_from"] <= as_of_iso <= row["valid_to"]
+                item.update(self._settlement(conn, int(row["id"]), as_of_iso))
+                accounts.append(item)
+        return {"as_of": as_of_iso, "accounts": accounts}
 
-    def list_transfers(self) -> list[dict[str, Any]]:
+    def list_transfers(self, as_of: str | None = None) -> dict[str, Any]:
+        as_of_iso = resolve_as_of(as_of)
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM transfers ORDER BY id DESC").fetchall()
-        return [dict(row) for row in rows]
+            transfers = []
+            for row in rows:
+                item = dict(row)
+                item["as_of"] = as_of_iso
+                item["settled"] = item["status"] == "approved" and item["effective_date"] <= as_of_iso
+                item["source"] = self._settlement(conn, int(row["from_account_id"]), as_of_iso)
+                item["target"] = self._settlement(conn, int(row["to_account_id"]), as_of_iso)
+                transfers.append(item)
+        return {"as_of": as_of_iso, "transfers": transfers}
+
+    def get_transfer(self, transfer_id: int, as_of: str | None = None) -> dict[str, Any]:
+        as_of_iso = resolve_as_of(as_of)
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone()
+            if not row:
+                raise DomainError("转让记录不存在", 404)
+            item = dict(row)
+            item["as_of"] = as_of_iso
+            item["settled"] = item["status"] == "approved" and item["effective_date"] <= as_of_iso
+            item["source"] = self._settlement(conn, int(row["from_account_id"]), as_of_iso)
+            item["target"] = self._settlement(conn, int(row["to_account_id"]), as_of_iso)
+        return item
 
     def audit(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -406,8 +719,8 @@ class Database:
 
 
 def seed_demo(db: Database) -> dict[str, int]:
-    if db.list_accounts():
-        return {str(a["name"]): int(a["id"]) for a in db.list_accounts()}
+    if db.list_accounts()["accounts"]:
+        return {str(a["name"]): int(a["id"]) for a in db.list_accounts()["accounts"]}
     upstream = db.create_account("alice", {"name": "北区水库", "region": "upstream", "holder": "北区水务公司", "priority": 1, "valid_from": "2026-01-01", "valid_to": "2026-12-31", "quota": 1000}, "editor")
     downstream = db.create_account("alice", {"name": "河口灌区", "region": "downstream", "holder": "河口合作社", "priority": 2, "valid_from": "2026-01-01", "valid_to": "2026-12-31", "quota": 500}, "editor")
     db.set_season_rule("alice", "upstream", 7, 0.35, "夏季上限", "editor")
@@ -450,23 +763,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        q = parse_qs(parsed.query)
         try:
             if parsed.path in {"/", "/index.html"}:
                 return self._html()
             if parsed.path == "/api/health":
                 return self._send({"ok": True})
             if parsed.path == "/api/accounts":
-                return self._send({"accounts": self.db.list_accounts()})
+                return self._send(self.db.list_accounts(q.get("as_of", [""])[0]))
             if parsed.path == "/api/transfers":
-                return self._send({"transfers": self.db.list_transfers()})
+                return self._send(self.db.list_transfers(q.get("as_of", [""])[0]))
             if parsed.path == "/api/audit":
                 return self._send({"audit": self.db.audit()})
             if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/available"):
                 account_id = int(parsed.path.split("/")[3])
-                return self._send(self.db.available(account_id))
+                return self._send(self.db.available(account_id, q.get("as_of", [""])[0]))
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 3 and parts[:2] == ["api", "transfers"]:
+                return self._send(self.db.get_transfer(int(parts[2]), q.get("as_of", [""])[0]))
             if parsed.path == "/api/drought/simulate":
-                q = parse_qs(parsed.query)
-                return self._send(self.db.simulate_drought(float(q.get("supply", ["0"])[0]), float(q.get("reduction", ["0"])[0])))
+                return self._send(self.db.simulate_drought(
+                    float(q.get("supply", ["0"])[0]),
+                    float(q.get("reduction", ["0"])[0]),
+                    q.get("as_of", [""])[0]))
             raise DomainError("接口不存在", 404)
         except (ValueError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))
@@ -489,8 +808,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.approve_transfer(int(parts[2]), actor, role))
             if len(parts) == 4 and parts[:2] == ["api", "transfers"] and parts[3] == "reject":
                 return self._send(self.db.reject_transfer(int(parts[2]), actor, role))
+            if len(parts) == 4 and parts[:2] == ["api", "transfers"] and parts[3] == "cancel":
+                return self._send(self.db.cancel_transfer(int(parts[2]), actor, role))
+            if len(parts) == 4 and parts[:2] == ["api", "transfers"] and parts[3] == "reschedule":
+                return self._send(self.db.reschedule_transfer(int(parts[2]), actor, body, role))
             if parts == ["api", "usage"]:
                 return self._send(self.db.record_usage(actor, body, role), 201)
+            if parts == ["api", "recompute"]:
+                return self._send(self.db.recompute(
+                    actor, body.get("account_id"), body.get("since"), role))
             raise DomainError("接口不存在", 404)
         except (ValueError, TypeError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))
